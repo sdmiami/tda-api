@@ -71,9 +71,17 @@ class _Handler:
     def label_message(self, msg):
         if 'content' in msg:
             new_msg = copy.deepcopy(msg)
-            for idx in range(len(msg['content'])):
-                self._field_enum_type.relabel_message(msg['content'][idx],
-                                                      new_msg['content'][idx])
+            # to accommodated with CHART_HISTORY_FUTURES service response
+            # TODO: To be validated
+            if msg['service'] == 'CHART_HISTORY_FUTURES':
+                for idx in range(len(msg['content'][0]['3'])):
+                    self._field_enum_type.relabel_message(msg['content'][0]['3'][idx],
+                                                          new_msg['content'][0]['3'][idx])
+            else:
+                for idx in range(len(msg['content'])):
+                    self._field_enum_type.relabel_message(msg['content'][idx],
+                                                          new_msg['content'][idx])
+
             return new_msg
         else:
             return msg
@@ -110,6 +118,9 @@ class StreamClient(EnumEnforcer):
         # Logging-related fields
         self.logger = get_logger()
         self.request_number = 0
+
+    # to be used for CHART_HISTORY_FUTURES section when calling method with start & end time
+    _DATETIME = datetime.datetime
 
     def req_num(self):
         self.request_number += 1
@@ -294,6 +305,15 @@ class StreamClient(EnumEnforcer):
                         labeled_d = handler.label_message(d)
                         handler(labeled_d)
 
+        # chart history futures data, response contains 'snapshot' instead of 'data'
+        # TODO: Review TDA-API relabeling features as response json structure is different than other services
+        if 'snapshot' in msg:
+            for d in msg['snapshot']:
+                if d['service'] in self._handlers:
+                    for handler in self._handlers[d['service']]:
+                        labeled_d = handler.label_message(d)
+                        handler(labeled_d)
+
         # notify
         if 'notify' in msg:
             for d in msg['notify']:
@@ -302,6 +322,28 @@ class StreamClient(EnumEnforcer):
                 else:
                     for handler in self._handlers[d['service']]:
                         handler(d)
+
+    # copied from client class, as we need to validate datetime objects
+    def __assert_type(self, name, value, exp_types):
+        value_type = type(value)
+        value_type_name = '{}.{}'.format(
+            value_type.__module__, value_type.__name__)
+        exp_type_names = ['{}.{}'.format(
+            t.__module__, t.__name__) for t in exp_types]
+        if not any(isinstance(value, t) for t in exp_types):
+            if len(exp_types) == 1:
+                error_str = "expected type '{}' for {}, got '{}'".format(
+                    exp_type_names[0], name, value_type_name)
+            else:
+                error_str = "expected type in ({}) for {}, got '{}'".format(
+                    ', '.join(exp_type_names), name, value_type_name)
+            raise ValueError(error_str)
+
+    def __datetime_as_millis(self, var_name, dt):
+        'Converts datetime objects to compatible millisecond values'
+        self.__assert_type(var_name, dt, [self._DATETIME])
+
+        return int(dt.timestamp() * 1000)
 
     ##########################################################################
     # LOGIN
@@ -606,6 +648,110 @@ class StreamClient(EnumEnforcer):
         '''
         self._handlers['CHART_FUTURES'].append(_Handler(handler,
                                                         self.ChartFuturesFields))
+
+    ##########################################################################
+    # CHART_HISTORY_FUTURES
+
+    class ChartHistoryFuturesFields(_BaseFieldEnum):
+        '''
+        `Official documentation https://developer.tdameritrade.com/content/
+        streaming-data#_Toc504640594`__
+
+        Data fields for equity OHLCV data. Primarily an implementation detail
+        and not used in client code. Provided here as documentation for key
+        values stored returned in the stream messages.
+        '''
+
+        #: Milliseconds since Epoch
+        CHART_TIME = 0
+
+        #: Opening price for the minute
+        OPEN_PRICE = 1
+
+        #: Highest price for the minute
+        HIGH_PRICE = 2
+
+        #: Chart’s lowest price for the minute
+        LOW_PRICE = 3
+
+        #: Closing price for the minute
+        CLOSE_PRICE = 4
+
+        #: Total volume for the minute
+        VOLUME = 5
+
+    class FuturesPriceHistory:
+        class Frequency(Enum):
+            #: Fixed frequency choices available for CHART_HISTORY_FUTURES service
+            ONE_MINUTE = 'm1'
+            FIVE_MINUTES = 'm5'
+            TEN_MINUTES = 'm10'
+            THIRTY_MINUTES = 'm30'
+            ONE_HOUR = 'h1'
+            ONE_DAY = 'd1'
+            ONE_WEEK = 'w1'
+            ONE_MONTH = 'n1'
+
+        class Period(Enum):
+            #: Flexible time period choices available for CHART_HISTORY_FUTURES service
+            FIVE_DAYS = 'd5'
+            FOUR_WEEK = 'w4'
+            TEN_MONTH = 'n10'
+            ONE_YEAR = 'y1'
+            TEN_YEARS = 'y10'
+
+    async def chart_history_futures(self, symbols, *, frequency=None, period=None, start_time=None, end_time=None):
+        '''
+        `Official documentation https://developer.tdameritrade.com/content/
+        streaming-data#_Toc504640594`__
+
+        Chart history for equities is available via requests to the MDMS services.
+        Only Futures chart history is available via Streamer Server.
+
+        :param symbols: Futures symbols to get chart history, example: /ES.
+        :param frequency: The number of the frequencyType to be included in each
+                            candle.
+        :param period: The number of periods to show. Should not be provided if
+                       ``start_time`` and ``end_time``.
+        :param start_time: Start time of chart in milliseconds since Epoch. (Optional)
+        :param end_time: End time of chart in milliseconds since Epoch. (Optional)
+        '''
+        period = self.convert_enum(period, self.FuturesPriceHistory.Period)
+        frequency = self.convert_enum(frequency, self.FuturesPriceHistory.Frequency)
+
+        service = 'CHART_HISTORY_FUTURES'
+        command = 'GET'
+        params = {
+            'symbol': ','.join(symbols),
+        }
+
+        if period is not None:
+            params['period'] = period
+        if frequency is not None:
+            params['frequency'] = frequency
+        if start_time is not None:
+            params['START_TIME'] = self.__datetime_as_millis(
+                'start_time', start_time)
+        if end_time is not None:
+            params['END_TIME'] = self.__datetime_as_millis(
+                'end_time', end_time)
+
+        # Can't used _service_op method for now as parameters are hardcoded in method
+
+        request, request_id = self._make_request(
+            service=service, command=command,
+            parameters=params)
+
+        await self._send({'requests': [request]})
+        await self._await_response(request_id, service, command)
+
+    def add_chart_history_futures_handler(self, handler):
+        '''
+        Adds a handler to the futures chart subscription. See
+        :ref:`registering_handlers` for details.
+        '''
+
+        self._handlers['CHART_HISTORY_FUTURES'].append(_Handler(handler, self.ChartHistoryFuturesFields))
 
     ##########################################################################
     # QUOTE
